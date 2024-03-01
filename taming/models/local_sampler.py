@@ -363,9 +363,10 @@ class LocalSamplerDualCodebookPE(LocalSampler):
         
         c = torch.nn.functional.interpolate(c, scale_factor=1/8,
                                             mode="bicubic", recompute_scale_factor=False, align_corners=True)
+        print(f'c.shape after interpolate: {c.shape}')
         c = self.embedder(c.permute(0, 2, 3, 1))
         c = c.permute(0, 3, 1, 2).reshape(c.shape[0], self.cdim, -1)
-        
+        print(f'c.shape: {c.shape}')
         if self.training and self.pkeep < 1.0:
             mask = torch.bernoulli(self.pkeep*torch.ones(z_indices.shape,
                                                          device=z_indices.device))

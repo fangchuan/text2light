@@ -43,9 +43,13 @@ def text2light(models: dict, prompts, outdir, params: dict):
     text = clip.tokenize(prompts).to(device)
     text_features = lan_model.encode_text(text)
     target_txt_emb = text_features / text_features.norm(dim=-1, keepdim=True)
+    print(f'target_txt_emb.shape:{target_txt_emb.shape}')
     cond, _ = get_knn(database, faiss_index, target_txt_emb.cpu().numpy().astype('float32'))
+    print(f'cond.shape:{cond.shape}')
     txt_cond = torch.from_numpy(cond.reshape(batch_size, 5, cond.shape[-1]))
+    print(f'txt_cond.shape:{txt_cond.shape}')
     txt_cond = torch.cat([txt_cond, txt_cond,], dim=-1).to(device)
+    print(f'txt_cond.shape:{txt_cond.shape}')
 
     # sample holistic condition
     bs = batch_size
@@ -77,11 +81,15 @@ def text2light(models: dict, prompts, outdir, params: dict):
     screen_points = np.stack([xx, yy], axis=-1)
     coord = (screen_points * 2 - 1) * np.array([np.pi, np.pi/2])
     spe = torch.from_numpy(coord).to(xsample_holistic).repeat(xsample_holistic.shape[0], 1, 1, 1).permute(0, 3, 1, 2)
+    print(f'spe.shape:{spe.shape}')
     spe = torch.nn.functional.interpolate(spe, scale_factor=1/8,
                                             mode="bicubic", recompute_scale_factor=False, align_corners=True)
     spe = local_sampler.embedder(spe.permute(0, 2, 3, 1))
     spe = spe.permute(0, 3, 1, 2)
+    print(f'spe.shape:{spe.shape}')
+    print(f'local_sample cdim: {local_sampler.cdim}')
 
+    print(f'xsample_holistic.shape:{xsample_holistic.shape}')
     _, h_indices = local_sampler.encode_to_h(xsample_holistic)
     cshape = [xsample_holistic.shape[0], 256, h // 16, w // 16]
     idx = torch.randint(0, 1024, (cshape[0], cshape[2], cshape[3])).to(h_indices)
@@ -112,10 +120,13 @@ def text2light(models: dict, prompts, outdir, params: dict):
             j_start = j-local_j
             j_end = j_start+16
             patch = idx[:,i_start:i_end,j_start:j_end]
+            # print(f'z_index patch.shape:{patch.shape}')
             patch = patch.reshape(patch.shape[0],-1)
+            # print(f'z_index patch.shape:{patch.shape}')
             cpatch = spe[:, :, i_start*2:i_end*2,j_start*2:j_end*2]
             cpatch = cpatch.reshape(cpatch.shape[0], local_sampler.cdim, -1)
             patch = torch.cat((h_indices, patch), dim=1)
+            # print(f'cpatch.shape:{cpatch.shape}')
             logits, _ = local_sampler.transformer(patch[:,:-1], embeddings=cpatch)
             logits = logits[:, -256:, :]
             logits = logits.reshape(cshape[0],16,16,-1)
@@ -134,7 +145,8 @@ def text2light(models: dict, prompts, outdir, params: dict):
             idx[:,i,j] = ix.reshape(-1)
     xsample = local_sampler.decode_to_img(idx, cshape)
     for i in range(xsample.shape[0]):
-        save_image(xsample[i], os.path.join(outdir, "ldr", "ldr_[{}].png".format(prompts[i])))
+        # save_image(xsample[i], os.path.join(outdir, "ldr", "ldr_[{}].png".format(prompts[i])))
+        save_image(xsample[i], os.path.join(outdir, "ldr", "ldr_text2light_pano.png"))
 
     # super-resolution inverse tone mapping
     if params['sritmo'] is not None:
@@ -144,7 +156,8 @@ def text2light(models: dict, prompts, outdir, params: dict):
         return
     
     for i in range(xsample.shape[0]):
-        cv2.imwrite(os.path.join(outdir, "ldr", "hrldr_[{}].png".format(prompts[i])), (ldr_hr_samples[i].permute(1, 2, 0).detach().cpu().numpy() + 1) * 127.5)
+        cv2.imwrite(os.path.join(outdir, "ldr", "hrldr_text2light_pano.png"), (ldr_hr_samples[i].permute(1, 2, 0).detach().cpu().numpy() + 1) * 127.5)
+        # cv2.imwrite(os.path.join(outdir, "ldr", "hrldr_[{}].png".format(prompts[i])), (ldr_hr_samples[i].permute(1, 2, 0).detach().cpu().numpy() + 1) * 127.5)
         cv2.imwrite(os.path.join(outdir, "hdr", "hdr_[{}].exr".format(prompts[i])), hdr_hr_samples[i].permute(1, 2, 0).detach().cpu().numpy())
 
 
@@ -259,7 +272,37 @@ def load_model(config, ckpt, gpu, eval_mode):
     model = load_model_from_config(config.model, state_dict, gpu=gpu, eval_mode=eval_mode)["model"]
     return model
 
+from thop import profile
+def profile_global_model(model):
+    # prepare the input
+    x = torch.randn(1, 3, 256, 128).cuda()
+    c = torch.randn(1, 1, 5, 512).cuda()
+    # calculate the number of trainable parameters
+    n_all_params = int(sum([np.prod(p.size()) for p in model.parameters()]))
+    n_trainable_params = int(sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, model.parameters())]))
+    print(f"Number of parameters in {model.__class__.__name__}:  {n_trainable_params} / {n_all_params}")
 
+    # profile the model
+    ops, params = profile(model, inputs=(x, c,))
+    print('FLOPs = ' + str(ops / 1000**3) + 'G')
+    print('Params = ' + str(params / 1000**2) + 'M')
+
+def profile_local_model(model):
+    # prepare the input
+    x = torch.randn(1, 3, 256, 256).cuda()
+    c = torch.randn(1, 2, 256, 256).cuda()
+    holistic = torch.randn(1, 3, 128, 156).cuda()
+    # calculate the number of trainable parameters
+    n_all_params = int(sum([np.prod(p.size()) for p in model.parameters()]))
+    n_trainable_params = int(sum([np.prod(p.size()) for p in filter(lambda p: p.requires_grad, model.parameters())]))
+    print(f"Number of parameters in {model.__class__.__name__}:  {n_trainable_params} / {n_all_params}")
+
+    # profile the model
+    ops, params = profile(model, inputs=(x, c, holistic,))
+    print('FLOPs = ' + str(ops / 1000**3) + 'G')
+    print('Params = ' + str(params / 1000**2) + 'M')
+
+import time
 if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
@@ -294,6 +337,7 @@ if __name__ == "__main__":
         print(OmegaConf.to_container(config))
     
     global_sampler = load_model(config, ckpt, gpu, eval_mode)
+    # profile_global_model(global_sampler)
 
     ckpt = None
     if opt.resume_local:
@@ -315,6 +359,7 @@ if __name__ == "__main__":
         print(OmegaConf.to_container(config))
 
     local_sampler = load_model(config, ckpt, gpu, eval_mode)
+    profile_local_model(local_sampler)
 
     outdir = opt.outdir
     os.makedirs(outdir, exist_ok=True)
@@ -357,4 +402,9 @@ if __name__ == "__main__":
     for i in range(0, len(prompts), opt.bs):
         end_i = min(len(prompts), i + opt.bs)
         prompt = prompts[i: i+opt.bs]
+        begin_tms = time.time()
         text2light(input_models, prompt, outdir, input_params)
+        end_tms = time.time()
+        print(f'[{i}/{len(prompts)}] takes {end_tms-begin_tms} seconds')
+
+    
